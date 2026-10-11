@@ -1,0 +1,15 @@
+[
+  {"query": "Who supervised this project?", "expected_source": "document", "keywords": ["Atika"]},
+  {"query": "Which university is this project submitted to?", "expected_source": "document", "keywords": ["Iqra"]},
+  {"query": "What degree is this project submitted for?", "expected_source": "document", "keywords": ["Computer Science"]},
+  {"query": "What testing techniques were used in this project?", "expected_source": "document", "keywords": ["unit", "integration"]},
+  {"query": "What does unit testing check in this project?", "expected_source": "document", "keywords": ["module"]},
+  {"query": "What is Test Case 1 about?", "expected_source": "document", "keywords": ["registration"]},
+  {"query": "Which components were combined during integration testing?", "expected_source": "document", "keywords": ["server"]},
+  {"query": "What is 15 times 7?", "expected_source": "direct", "keywords": ["105"]},
+  {"query": "What is the capital of France?", "expected_source": "direct", "keywords": ["Paris"]},
+  {"query": "Who is the current CEO of Microsoft?", "expected_source": "web", "keywords": ["Nadella"]},
+  {"query": "I want to talk to a real person", "expected_source": "escalated", "keywords": []},
+  {"query": "What is your refund policy for orders?", "expected_source": "escalated", "keywords": []},
+  {"query": "Can I speak to a human agent please?", "expected_source": "escalated", "keywords": []}
+]

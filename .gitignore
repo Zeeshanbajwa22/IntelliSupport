@@ -1,0 +1,9 @@
+venv/
+.env
+__pycache__/
+user_data/
+tickets.db
+eval_results.json
+eval_data/*.pdf
+temp_*.pdf
+.pytest_cache/
