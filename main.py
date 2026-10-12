@@ -1,6 +1,7 @@
 import re
 import uuid
 import secrets
+from fastapi.responses import HTMLResponse
 from fastapi import Request, HTTPException, Header, Depends
 from pydantic import Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -56,12 +57,15 @@ claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 ROUTER_MODEL = "claude-haiku-5-5"   # cheap and fast, for the one-word routing decision
 ANSWER_MODEL = "claude-sonnet-5-5"  # stronger, for the final answers
 
-def call_claude(prompt: str, model: str, max_tokens: int = 1000) -> str:
+def call_claude(prompt: str, model: str, max_tokens: int = 1000, usage: dict = None) -> str:
     response = claude_client.messages.create(
         model=model,
         max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}]
     )
+    if usage is not None:
+        usage["in"] += response.usage.input_tokens
+        usage["out"] += response.usage.output_tokens
     return response.content[0].text.strip()
 
 def get_user_vectorstore_path(user_id: str) -> Path:
@@ -115,7 +119,7 @@ def search_web(query: str) -> str:
     except Exception as e:
         return f"Web search failed: {str(e)}"
 
-def decide_action(query: str) -> str:
+def decide_action(query: str, usage: dict = None) -> str:
     """Ask the LLM to decide: 'document', 'web', or 'direct'."""
     decision_prompt = f"""You are deciding how to answer a user's question. 
 Respond with ONLY ONE WORD: "document", "web", or "direct".
@@ -127,7 +131,7 @@ Respond with ONLY ONE WORD: "document", "web", or "direct".
 Question: {query}
 
 Answer with one word only:"""
-    decision = call_claude(decision_prompt, ROUTER_MODEL, max_tokens=10).lower().strip(' .\'"')
+    decision = call_claude(decision_prompt, ROUTER_MODEL, max_tokens=10, usage=usage).lower().strip(' .\'"')
     
     # Safety fallback in case the model says something unexpected
     if decision not in ["document", "web", "direct"]:
@@ -152,6 +156,25 @@ def init_db():
 
 init_db()
 
+def init_metrics():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT, user_id TEXT, source_used TEXT,
+        latency_ms INTEGER, in_tokens INTEGER, out_tokens INTEGER, status TEXT)""")
+    conn.commit()
+    conn.close()
+
+init_metrics()
+
+def log_request(user_id, source, latency_ms, usage, status):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO requests (created_at, user_id, source_used, latency_ms, in_tokens, out_tokens, status) VALUES (?,?,?,?,?,?,?)",
+        (datetime.now(timezone.utc).isoformat(), user_id, source, latency_ms, usage["in"], usage["out"], status)
+    )
+    conn.commit()
+    conn.close()
 def create_ticket(user_id: str, question: str, reason: str) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
@@ -180,9 +203,7 @@ class Answer(BaseModel):
     source_used: str
     ticket_id: Optional[int] = None
 
-@app.post("/ask", response_model=Answer)
-@limiter.limit("30/minute")
-def ask(request: Request, question: Question):
+def handle_question(question: Question, usage: dict) -> Answer:
     validate_user_id(question.user_id)
     # Trigger 1: explicit request for a human
     if wants_human(question.query):
@@ -193,7 +214,7 @@ def ask(request: Request, question: Question):
             ticket_id=tid
         )
 
-    action = decide_action(question.query)
+    action = decide_action(question.query, usage)
     context = ""
 
     if action == "document":
@@ -226,7 +247,7 @@ Answer:"""
     else:
         prompt = f"Answer this question directly and concisely:\n\n{question.query}"
 
-    answer_text = call_claude(prompt, ANSWER_MODEL)
+    answer_text = call_claude(prompt, ANSWER_MODEL, usage=usage)
 
     # Trigger 2: the agent can't answer from what it found
     if answer_text.upper().startswith("ESCALATE"):
@@ -250,4 +271,81 @@ def list_tickets():
         {"id": r[0], "user_id": r[1], "question": r[2], "reason": r[3], "status": r[4], "created_at": r[5]}
         for r in rows
     ]
+@app.post("/ask", response_model=Answer)
+@limiter.limit("30/minute")
+def ask(request: Request, question: Question):
+    start = time.perf_counter()
+    usage = {"in": 0, "out": 0}
+    try:
+        answer = handle_question(question, usage)
+    except HTTPException:
+        raise
+    except Exception:
+        log_request(question.user_id, "error", int((time.perf_counter() - start) * 1000), usage, "error")
+        raise
+    log_request(question.user_id, answer.source_used, int((time.perf_counter() - start) * 1000), usage, "ok")
+    return answer
 
+
+PRICE_IN_PER_MTOK = 0.0   # USD per million input tokens of your ANSWER model (fill from Anthropic's pricing page)
+PRICE_OUT_PER_MTOK = 0.0  # USD per million output tokens
+
+@app.get("/metrics", dependencies=[Depends(require_admin)])
+def metrics():
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT created_at, user_id, source_used, latency_ms, in_tokens, out_tokens, status FROM requests ORDER BY id DESC"
+    ).fetchall()
+    conn.close()
+
+    total = len(rows)
+    by_source = {}
+    for r in rows:
+        by_source[r[2]] = by_source.get(r[2], 0) + 1
+    lat = sorted(r[3] for r in rows)
+    in_tok = sum(r[4] for r in rows)
+    out_tok = sum(r[5] for r in rows)
+    return {
+        "total": total,
+        "avg_latency_ms": round(sum(lat) / total) if total else 0,
+        "p95_latency_ms": lat[int(0.95 * (len(lat) - 1))] if lat else 0,
+        "escalation_rate_pct": round(100 * by_source.get("escalated", 0) / total, 1) if total else 0,
+        "errors": sum(1 for r in rows if r[6] == "error"),
+        "in_tokens": in_tok,
+        "out_tokens": out_tok,
+        "est_cost_usd": round(in_tok / 1e6 * PRICE_IN_PER_MTOK + out_tok / 1e6 * PRICE_OUT_PER_MTOK, 4),
+        "by_source": by_source,
+        "recent": [
+            {"created_at": r[0], "user_id": r[1], "source_used": r[2], "latency_ms": r[3], "status": r[6]}
+            for r in rows[:10]
+        ],
+    }
+
+DASHBOARD_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>IntelliSupport Dashboard</title>
+<style>body{font-family:sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem}
+.card{display:inline-block;background:#f3f4f6;border-radius:8px;padding:12px 16px;margin:6px}
+table{border-collapse:collapse;width:100%;margin-top:1rem}td,th{border-bottom:1px solid #ddd;padding:6px;text-align:left}</style></head>
+<body><h1>IntelliSupport Dashboard</h1>
+<input id="key" type="password" placeholder="Admin key"> <button onclick="load()">Load</button>
+<div id="cards"></div><table id="tbl"></table>
+<script>
+async function load(){
+  const r = await fetch('/metrics', {headers: {'x-api-key': document.getElementById('key').value}});
+  const cards = document.getElementById('cards'); const tbl = document.getElementById('tbl');
+  cards.textContent=''; tbl.textContent='';
+  if(!r.ok){cards.textContent='Wrong key or server error ('+r.status+')'; return;}
+  const m = await r.json();
+  const add=(k,v)=>{const d=document.createElement('div'); d.className='card'; d.textContent=k+': '+v; cards.appendChild(d);};
+  add('Total requests', m.total); add('Avg latency (ms)', m.avg_latency_ms); add('p95 latency (ms)', m.p95_latency_ms);
+  add('Escalation rate', m.escalation_rate_pct+'%'); add('Errors', m.errors);
+  add('Input tokens', m.in_tokens); add('Output tokens', m.out_tokens); add('Est. cost (USD)', m.est_cost_usd);
+  for (const [k,v] of Object.entries(m.by_source)) add('Source '+k, v);
+  const head = tbl.insertRow();
+  for (const h of ['Time','User','Source','ms','Status']) {const th=document.createElement('th'); th.textContent=h; head.appendChild(th);}
+  for (const x of m.recent) {const row=tbl.insertRow(); for (const c of [x.created_at,x.user_id,x.source_used,x.latency_ms,x.status]) row.insertCell().textContent=c;}
+}
+</script></body></html>"""
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return DASHBOARD_HTML
