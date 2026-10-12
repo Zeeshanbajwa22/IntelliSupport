@@ -1,0 +1,10 @@
+venv/
+.env
+.git/
+.github/
+__pycache__/
+user_data/
+tickets.db
+tests/
+eval_data/
+*.pdf
