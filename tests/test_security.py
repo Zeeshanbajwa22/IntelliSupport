@@ -3,7 +3,8 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "dummy-key-for-tests")
 os.environ["ADMIN_API_KEY"] = "ci-test-key"
 
 from fastapi.testclient import TestClient
-from main import app
+import secrets
+from main import app, create_user
 
 client = TestClient(app)
 
@@ -35,6 +36,20 @@ def test_tickets_are_locked():
     assert client.get("/tickets", headers={"x-api-key": "ci-test-key"}).status_code == 200
 
 def test_human_request_escalates_without_calling_llm():
-    r = client.post("/ask", json={"user_id": "ci1", "query": "I want to talk to a human"})
+    uid = "ci" + secrets.token_hex(4)
+    token = create_user(uid)
+    r = client.post("/ask", json={"user_id": uid, "query": "I want to talk to a human"},
+                    headers={"x-user-token": token})
     assert r.status_code == 200
     assert r.json()["source_used"] == "escalated"
+
+def test_ask_requires_token():
+    r = client.post("/ask", json={"user_id": "nobody", "query": "hello"})
+    assert r.status_code == 401
+
+def test_upload_to_existing_user_requires_token():
+    uid = "ci" + secrets.token_hex(4)
+    create_user(uid)
+    r = client.post("/upload", data={"user_id": uid},
+                    files={"file": ("a.pdf", b"%PDF-1.4", "application/pdf")})
+    assert r.status_code == 401

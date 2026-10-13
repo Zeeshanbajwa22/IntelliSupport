@@ -6,4 +6,4 @@ tickets.db
 eval_results.json
 eval_data/*.pdf
 temp_*.pdf
-.pytest_cache/
+.pytest_cache/eval_token.txt

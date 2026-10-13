@@ -1,6 +1,7 @@
 import re
 import uuid
 import secrets
+import hashlib
 from fastapi.responses import HTMLResponse
 from fastapi import Request, HTTPException, Header, Depends
 from pydantic import Field
@@ -77,8 +78,11 @@ def root():
     return {"status": "IntelliSupport API is running"}
 @app.post("/upload")
 @limiter.limit("5/minute")
-async def upload_document(request: Request, user_id: str = Form(...), file: UploadFile = File(...)):
+async def upload_document(request: Request, user_id: str = Form(...), file: UploadFile = File(...), x_user_token: str = Header(default="")):
     validate_user_id(user_id)
+    is_new = not user_exists(user_id)
+    if not is_new and not verify_token(user_id, x_user_token):
+        raise HTTPException(status_code=401, detail="Invalid or missing user token.")
 
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
@@ -107,7 +111,11 @@ async def upload_document(request: Request, user_id: str = Form(...), file: Uplo
     finally:
         temp_path.unlink(missing_ok=True)
 
-    return {"status": "success", "user_id": user_id, "chunks_stored": len(chunks)}
+    result = {"status": "success", "user_id": user_id, "chunks_stored": len(chunks)}
+    if is_new:
+        result["access_token"] = create_user(user_id)
+        result["note"] = "Save this token now. It is shown only once."
+    return result
 def search_web(query: str) -> str:
     """Search the web and return a summary of results."""
     try:
@@ -175,6 +183,41 @@ def log_request(user_id, source, latency_ms, usage, status):
     )
     conn.commit()
     conn.close()
+def init_users():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        user_id TEXT PRIMARY KEY, token_hash TEXT, created_at TEXT)""")
+    conn.commit()
+    conn.close()
+
+init_users()
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def user_exists(user_id: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+def create_user(user_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO users (user_id, token_hash, created_at) VALUES (?, ?, ?)",
+                 (user_id, _hash_token(token), datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+    return token
+
+def verify_token(user_id: str, token: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT token_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    if not row or not token:
+        return False
+    return secrets.compare_digest(row[0], _hash_token(token))
+
 def create_ticket(user_id: str, question: str, reason: str) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
@@ -273,7 +316,11 @@ def list_tickets():
     ]
 @app.post("/ask", response_model=Answer)
 @limiter.limit("30/minute")
-def ask(request: Request, question: Question):
+def ask(request: Request, question: Question, x_user_token: str = Header(default="")):
+    validate_user_id(question.user_id)
+    if not verify_token(question.user_id, x_user_token):
+        raise HTTPException(status_code=401, detail="Invalid or missing user token.")
+
     start = time.perf_counter()
     usage = {"in": 0, "out": 0}
     try:

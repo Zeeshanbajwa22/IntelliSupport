@@ -10,22 +10,36 @@ CASES_PATH = "eval_data/eval_set.json"
 PASS_THRESHOLD = 0.8
 
 
+import os
+TOKEN_FILE = "eval_token.txt"
+
+def auth_headers():
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE) as f:
+            return {"x-user-token": f.read().strip()}
+    return {}
 def upload_pdf():
     with open(PDF_PATH, "rb") as f:
         r = requests.post(
             f"{BASE_URL}/upload",
             data={"user_id": USER_ID},
             files={"file": ("sample.pdf", f, "application/pdf")},
+            headers=auth_headers(),
             timeout=300,
         )
     r.raise_for_status()
-    print("Uploaded test document:", r.json())
+    data = r.json()
+    if "access_token" in data:
+        with open(TOKEN_FILE, "w") as tf:
+            tf.write(data["access_token"])
+    print("Uploaded test document, chunks stored:", data["chunks_stored"])
 
 
 def ask(query):
     r = requests.post(
         f"{BASE_URL}/ask",
         json={"user_id": USER_ID, "query": query},
+        headers=auth_headers(),
         timeout=120,
     )
     r.raise_for_status()
