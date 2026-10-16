@@ -22,12 +22,12 @@ from fastapi import FastAPI, UploadFile, File, Form
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
+from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 from langchain_chroma import Chroma
 
 # Load environment variables
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
-
 app = FastAPI(title="IntelliSupport API")
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -50,7 +50,18 @@ BASE_VECTORSTORE_DIR = Path("./user_data")
 BASE_VECTORSTORE_DIR.mkdir(exist_ok=True)
 
 # Local embedding model (runs on your own computer, no API credits needed)
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+class OnnxEmbeddings(Embeddings):
+    """Same all-MiniLM-L6-v2 model, run with ONNX instead of PyTorch (much less RAM)."""
+    def __init__(self):
+        self._ef = ONNXMiniLM_L6_V2()
+
+    def embed_documents(self, texts):
+        return [[float(x) for x in v] for v in self._ef(texts)]
+
+    def embed_query(self, text):
+        return self.embed_documents([text])[0]
+
+embedding_model = OnnxEmbeddings()
 
 # Claude client
 claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))

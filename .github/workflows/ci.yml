@@ -16,7 +16,7 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install CPU-only PyTorch (much smaller than the default)
+      
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install dependencies
